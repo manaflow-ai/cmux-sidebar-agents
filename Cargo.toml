@@ -1,0 +1,16 @@
+[package]
+name = "cmux-sidebar-agents"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Monitor AI agents and notifications in a cmux sidebar"
+repository = "https://github.com/manaflow-ai/cmux-sidebar-agents"
+homepage = "https://github.com/manaflow-ai/cmux-sidebar-agents"
+
+[dependencies]
+anyhow = "1.0.100"
+cmux-client = "0.1"
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+serde_json = "1.0.149"
