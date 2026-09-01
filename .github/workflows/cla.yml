@@ -170,8 +170,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      # The maintained action leaves failed-check recovery to a separate
-      # exact-head rerun worker. Keep recovery advisory until that worker exists.
+      # The trusted rerun worker refreshes the exact PR-head check after a
+      # valid signing or recheck comment.
       # The job result is the required check run; the action does not call the
       # commit-status API, so statuses: write is intentionally absent.
       contents: write
@@ -458,8 +458,8 @@ jobs:
       - CLASignerPreflight
       - CLAAssistant
     # Issue-comment workflows run on the default branch SHA, not the PR head.
-    # This result remains advisory until a trusted exact-head rerun worker
-    # refreshes the PR check after a signature comment.
+    # RerunFailedCLA validates the live head and refreshes the failed
+    # pull_request_target check after a valid signing or recheck comment.
     if: >-
       always() &&
       needs.CLACommentGate.result == 'success' &&

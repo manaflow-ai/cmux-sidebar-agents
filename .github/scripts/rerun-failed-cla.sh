@@ -70,7 +70,7 @@ head_repo="$(jq -r '.head.repo.full_name' <<<"${pr_json}")"
 head_repo_id="$(jq -r '.head.repo.id' <<<"${pr_json}")"
 opener_id="$(jq -r '.user.id' <<<"${pr_json}")"
 is_sha "${head_sha}" || fail 'The live pull request head SHA is invalid'
-is_id "${head_repo_id}" || fail 'The live head repository ID is invalid'
+is_id "${head_repo_id}" || fail 'The live pull request head repository ID is invalid'
 is_id "${opener_id}" || fail 'The live pull request opener ID is invalid'
 if [[ "${COMMENT_BODY}" == "${SIGN_PHRASE}" ]]; then
   # The maintained preflight authenticates the signer against the live PR
@@ -87,6 +87,8 @@ else
   fi
 fi
 
+# Resolve the workflow ID by exact path and active state. The run-list endpoint
+# is then scoped to that immutable workflow identity instead of a name search.
 workflow_page="$(gh api \
   --method GET \
   --raw-field per_page=100 \
@@ -99,68 +101,104 @@ workflow_id="$(jq -r \
   <<<"${workflow_page}")"
 is_id "${workflow_id}" || fail 'The trusted CLA workflow is not uniquely active'
 
-runs_page="$(gh api \
-  --method GET \
-  --raw-field event="${TARGET_EVENT}" \
-  --raw-field branch="${head_ref}" \
-  --raw-field per_page=100 \
-  "repos/${GH_REPO}/actions/workflows/${workflow_id}/runs" 2>/dev/null)" ||
-  fail 'Could not query CLA workflow runs'
-jq -e '.workflow_runs | type == "array" and length <= 100' <<<"${runs_page}" >/dev/null ||
-  fail 'The CLA workflow run response is malformed or unbounded'
-run_count="$(jq -r '.workflow_runs | length' <<<"${runs_page}")"
-[[ "${run_count}" =~ ^[0-9]+$ ]] || fail 'Could not count CLA workflow runs'
-(( run_count < 100 )) || fail 'The CLA workflow run page is full; create a fresh lifecycle run before requesting a refresh'
-
-candidate="$(jq -c \
-  --arg path "${WORKFLOW_PATH}" \
-  --arg event "${TARGET_EVENT}" \
-  --argjson workflow_id "${workflow_id}" \
-  --arg sha "${head_sha}" \
-  --arg ref "${head_ref}" \
-  --arg repo "${GH_REPO}" \
-  --arg head_repo "${head_repo}" \
-  --argjson head_repo_id "${head_repo_id}" \
-  --argjson number "${PR_NUMBER}" \
-  --arg before "${COMMENT_CREATED_AT}" \
-  '[.workflow_runs[]?
-    | select(
-        .path == $path and .event == $event and
-        (.workflow_id | type == "number") and .workflow_id == $workflow_id and
-        (.head_sha | type == "string") and .head_sha == $sha and
-        .head_branch == $ref and (.id | type == "number" and . > 0) and
-        .status == "completed" and .conclusion == "failure" and
-        (.created_at | type == "string") and .created_at <= $before and
-        ((.head_repository | type == "object" and
-          .full_name == $head_repo and .id == $head_repo_id) or
-         (.head_repository == null and $head_repo == $repo)) and
-        ((.pull_requests == null or (.pull_requests | type == "array")) and
-         (if ((.pull_requests // []) | length) == 0 then true else
-            any(.pull_requests[]?; (.number | type == "number") and .number == $number)
-          end))
-      )
-    | {id, head_sha, head_branch, created_at, pull_requests, head_repository}
-  ] | sort_by([.created_at, .id]) | if length > 0 then .[-1] else empty end' \
-  <<<"${runs_page}")"
-[[ -n "${candidate}" ]] || {
-  echo '::notice::No failed CLA lifecycle run exists for the current pull request head; no refresh is needed.'
-  exit 0
-}
+# A lifecycle run can still be queued when the contributor posts the signing
+# comment. Poll a bounded number of times, and bind every candidate to the
+# exact live head instead of relying on the comment timestamp. GitHub does not
+# expose an event ID that links the two runs, so the head/base/workflow checks
+# are the authorization boundary.
+candidate=''
+max_attempts=12
+for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+  runs_page="$(gh api \
+    --method GET \
+    --raw-field event="${TARGET_EVENT}" \
+    --raw-field branch="${head_ref}" \
+    --raw-field per_page=100 \
+    "repos/${GH_REPO}/actions/workflows/${workflow_id}/runs" 2>/dev/null)" ||
+    fail 'Could not query CLA workflow runs'
+  jq -e '.workflow_runs | type == "array" and length <= 100' <<<"${runs_page}" >/dev/null ||
+    fail 'The CLA workflow run response is malformed or unbounded'
+  run_count="$(jq -r '.workflow_runs | length' <<<"${runs_page}")"
+  [[ "${run_count}" =~ ^[0-9]+$ ]] || fail 'Could not count CLA workflow runs'
+  (( run_count < 100 )) || fail 'The CLA workflow run page is full; create a fresh lifecycle run before requesting a refresh'
+  candidate="$(jq -c \
+    --arg path "${WORKFLOW_PATH}" \
+    --arg event "${TARGET_EVENT}" \
+    --argjson workflow_id "${workflow_id}" \
+    --arg sha "${head_sha}" \
+    --arg ref "${head_ref}" \
+    --arg repo "${GH_REPO}" \
+    --arg head_repo "${head_repo}" \
+    --argjson head_repo_id "${head_repo_id}" \
+    --argjson number "${PR_NUMBER}" \
+    '[.workflow_runs[]?
+      | select(
+          .path == $path and
+          .event == $event and
+          (.workflow_id | type == "number") and .workflow_id == $workflow_id and
+          (.head_sha | type == "string") and .head_sha == $sha and
+          .head_branch == $ref and
+          (.id | type == "number" and . > 0) and
+          (.status | type == "string") and
+          ((.conclusion == null) or (.conclusion | type == "string")) and
+          (.created_at | type == "string") and
+          ((.head_repository | type == "object" and
+            .full_name == $head_repo and .id == $head_repo_id) or
+           (.head_repository == null and $head_repo == $repo)) and
+          ((.pull_requests == null or (.pull_requests | type == "array")) and
+           (if ((.pull_requests // []) | length) == 0 then true else
+              any(.pull_requests[]?; (.number | type == "number") and .number == $number)
+            end))
+        )
+      | {id, head_sha, head_branch, status, conclusion, created_at, pull_requests, head_repository}
+    ] | sort_by([.created_at, .id]) | if length > 0 then .[-1] else empty end' \
+    <<<"${runs_page}")"
+  if [[ -n "${candidate}" ]]; then
+    candidate_status="$(jq -r '.status' <<<"${candidate}")"
+    candidate_conclusion="$(jq -r '.conclusion // ""' <<<"${candidate}")"
+    case "${candidate_status}" in
+      completed)
+        case "${candidate_conclusion}" in
+          failure) break ;;
+          success)
+            echo '::notice::The latest exact-head CLA lifecycle run already succeeded; no refresh is needed.'
+            exit 0
+            ;;
+          *) fail 'The latest exact-head CLA lifecycle run has a non-rerunnable conclusion' ;;
+        esac
+        ;;
+      queued|in_progress|pending|requested|waiting) ;;
+      *) fail 'The latest exact-head CLA lifecycle run has an unexpected status' ;;
+    esac
+  fi
+  if (( attempt < max_attempts )); then
+    sleep 5
+  fi
+done
+[[ -n "${candidate}" ]] || fail 'No exact-head CLA lifecycle run appeared during the bounded wait'
+[[ "$(jq -r '.status' <<<"${candidate}")" == 'completed' &&
+   "$(jq -r '.conclusion // ""' <<<"${candidate}")" == 'failure' ]] ||
+  fail 'The exact-head CLA lifecycle run did not finish with a rerunnable failure during the bounded wait'
 run_id="$(jq -r '.id' <<<"${candidate}")"
 is_id "${run_id}" || fail 'The selected CLA run ID is invalid'
 
 validate_run() {
   local payload="$1"
   jq -e \
-    --argjson id "${run_id}" --argjson workflow_id "${workflow_id}" --arg event "${TARGET_EVENT}" \
-    --arg path "${WORKFLOW_PATH}" --arg sha "${head_sha}" --arg ref "${head_ref}" \
-    --arg repo "${GH_REPO}" --arg head_repo "${head_repo}" \
-    --argjson head_repo_id "${head_repo_id}" --argjson number "${PR_NUMBER}" \
-    --arg before "${COMMENT_CREATED_AT}" \
+    --argjson id "${run_id}" \
+    --argjson workflow_id "${workflow_id}" \
+    --arg event "${TARGET_EVENT}" \
+    --arg path "${WORKFLOW_PATH}" \
+    --arg sha "${head_sha}" \
+    --arg ref "${head_ref}" \
+    --arg repo "${GH_REPO}" \
+    --arg head_repo "${head_repo}" \
+    --argjson head_repo_id "${head_repo_id}" \
+    --argjson number "${PR_NUMBER}" \
     '.id == $id and .workflow_id == $workflow_id and .path == $path and .event == $event and
      .head_sha == $sha and .head_branch == $ref and
      .status == "completed" and .conclusion == "failure" and
-     (.created_at | type == "string") and .created_at <= $before and
+     (.created_at | type == "string") and
      ((.head_repository | type == "object" and
        .full_name == $head_repo and .id == $head_repo_id) or
       (.head_repository == null and $head_repo == $repo)) and
@@ -204,7 +242,11 @@ if [[ "${run_has_association}" != 'true' ]]; then
   validate_unique_open_head
 fi
 
-jobs_json="$(gh api --method GET --raw-field per_page=100 \
+# Only the two signer/result jobs may be failed. This prevents this refresh
+# command from rerunning an unrelated future job added to the workflow.
+jobs_json="$(gh api \
+  --method GET \
+  --raw-field per_page=100 \
   "repos/${GH_REPO}/actions/runs/${run_id}/jobs" 2>/dev/null)" ||
   fail 'Could not query jobs for the selected CLA run'
 jq -e '.jobs | type == "array" and length > 0 and length <= 100 and
@@ -215,11 +257,14 @@ jq -e 'length > 0 and all(.[]; .conclusion == "failure" and
        (.name == "CLA Signer" or .name == "CLA Assistant v2"))' \
   <<<"${failed_jobs}" >/dev/null || fail 'The selected run contains an unexpected failed job'
 
+# Recheck both live objects immediately before the only state-changing call.
 latest_pr_json="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" 2>/dev/null)" ||
   fail 'Could not recheck the pull request before refresh'
-jq -e --arg repo "${GH_REPO}" --arg base "${TARGET_BASE_REF}" \
-  --argjson number "${PR_NUMBER}" --arg sha "${head_sha}" --arg ref "${head_ref}" \
-  --arg head_repo "${head_repo}" --argjson head_repo_id "${head_repo_id}" \
+jq -e \
+  --arg repo "${GH_REPO}" --arg base "${TARGET_BASE_REF}" \
+  --argjson number "${PR_NUMBER}" --arg sha "${head_sha}" \
+  --arg ref "${head_ref}" --arg head_repo "${head_repo}" \
+  --argjson head_repo_id "${head_repo_id}" \
   '.number == $number and .state == "open" and .base.ref == $base and
    .base.repo.full_name == $repo and .head.sha == $sha and
    .head.ref == $ref and .head.repo.full_name == $head_repo and
